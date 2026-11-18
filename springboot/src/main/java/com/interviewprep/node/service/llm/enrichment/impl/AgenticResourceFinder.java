@@ -1,0 +1,169 @@
+package com.interviewprep.node.service.llm.enrichment.impl;
+
+import com.interviewprep.node.service.llm.enrichment.ExistingResource;
+import com.interviewprep.node.service.llm.enrichment.NonRetryableEnrichmentException;
+import com.interviewprep.node.service.llm.enrichment.ProposedResource;
+import com.interviewprep.node.service.llm.enrichment.ResourceFinder;
+import com.interviewprep.node.service.llm.enrichment.RetryableEnrichmentException;
+import com.interviewprep.node.service.llm.enrichment.SearchResult;
+import com.interviewprep.node.service.llm.enrichment.SearchTools;
+import com.interviewprep.node.service.llm.enrichment.SearchType;
+import dev.langchain4j.agent.tool.P;
+import dev.langchain4j.agent.tool.Tool;
+import dev.langchain4j.exception.InvalidRequestException;
+import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.service.AiServices;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.stereotype.Component;
+
+/**
+ * The only autonomous piece of enrichment: loops over {@link SearchTools} via a LangChain4j
+ * tool-calling {@code AiServices} instance built fresh per call (not a Spring-managed
+ * {@code @AiService}, so {@link #MAX_ROUND_TRIPS} can be enforced — see {@link ResourceFinderAi}).
+ * Bounded in both iterations ({@code maxToolCallingRoundTrips}) and wall-clock time ({@link
+ * #MAX_ELAPSED_SECONDS}), independent bounds because a slow individual model/tool call and a long
+ * back-and-forth are different failure shapes.
+ */
+@Component
+class AgenticResourceFinder implements ResourceFinder {
+
+  private static final int MAX_ROUND_TRIPS = 8;
+  // Leaves room for RateLimitRetryingChatModel to wait out a few Groq rate limits (each the time
+  // Groq asks for plus 4s) mid-loop; timing out during a wait would restart the search from round
+  // 1.
+  private static final int MAX_ELAPSED_SECONDS = 120;
+  private static final int MAX_RESOURCES = 6;
+
+  // Tunable defaults, not exhaustive — the video/practice tools hard-filter to these via Exa's
+  // includeDomains, so a topic whose only good resource lives on a site outside this list simply
+  // won't get one from that tool; the LLM still has webSearch (open web) as a fallback.
+  private static final List<String> VIDEO_DOMAINS = List.of("youtube.com");
+  private static final List<String> PRACTICE_DOMAINS =
+      List.of(
+          "leetcode.com", "neetcode.io", "interviewing.io", "hellointerview.com", "educative.io");
+
+  private final ChatModel chatModel;
+  private final SearchTools searchTools;
+
+  AgenticResourceFinder(
+      @Qualifier("toolCallingChatModel") ChatModel chatModel, SearchTools searchTools) {
+    this.chatModel = chatModel;
+    this.searchTools = searchTools;
+  }
+
+  @Override
+  public List<ProposedResource> findResources(Long topicId, String topicLabel, String level) {
+    ResourceSearchToolAdapter adapter = new ResourceSearchToolAdapter(searchTools, topicId);
+    ResourceFinderAi ai =
+        AiServices.builder(ResourceFinderAi.class)
+            .chatModel(chatModel)
+            .tools(adapter)
+            .maxToolCallingRoundTrips(MAX_ROUND_TRIPS)
+            .build();
+
+    List<ProposedResource> proposals =
+        callWithTimeout(() -> ai.find(topicLabel, level).resources());
+
+    return proposals.stream()
+        // URLs are checked here, after the loop, not as a model tool: each tool call is another
+        // round trip that resends the whole conversation, and those extra rounds pushed single
+        // requests past Groq's tokens-per-minute limit.
+        .filter(p -> searchTools.validateUrl(p.url()))
+        .limit(MAX_RESOURCES)
+        .toList();
+  }
+
+  private List<ProposedResource> callWithTimeout(
+      java.util.function.Supplier<List<ProposedResource>> call) {
+    CompletableFuture<List<ProposedResource>> future = CompletableFuture.supplyAsync(call);
+    try {
+      return future.orTimeout(MAX_ELAPSED_SECONDS, TimeUnit.SECONDS).join();
+    } catch (CompletionException e) {
+      Throwable cause = e.getCause() != null ? e.getCause() : e;
+      if (cause instanceof TimeoutException) {
+        throw new RetryableEnrichmentException(
+            "resource finder exceeded " + MAX_ELAPSED_SECONDS + "s", cause);
+      }
+      if (isMalformedToolCall(cause)) {
+        throw new RetryableEnrichmentException("model made a malformed tool call", cause);
+      }
+      if (cause instanceof RuntimeException re) {
+        throw re;
+      }
+      throw new NonRetryableEnrichmentException("resource finder failed", cause);
+    }
+  }
+
+  /**
+   * gpt-oss sometimes sends its final answer as a call to a tool named "JSON" that doesn't exist,
+   * and Groq rejects the whole request ({@code tool_use_failed}). It's a sampling quirk, not a bad
+   * request, so a fresh attempt usually succeeds.
+   */
+  private static boolean isMalformedToolCall(Throwable cause) {
+    return cause instanceof InvalidRequestException
+        && cause.getMessage() != null
+        && cause.getMessage().contains("tool_use_failed");
+  }
+
+  /**
+   * Built fresh per {@link #findResources} call so {@code topicId} is bound correctly even though
+   * {@link SearchTools} itself is a shared singleton — the underlying model/tool-calling loop has
+   * no other way to learn which topic {@code existingResources} should scope to.
+   */
+  static class ResourceSearchToolAdapter {
+
+    private final SearchTools searchTools;
+    private final Long topicId;
+
+    ResourceSearchToolAdapter(SearchTools searchTools, Long topicId) {
+      this.searchTools = searchTools;
+      this.topicId = topicId;
+    }
+
+    @Tool(
+        "Search the open web for a reference or explainer resource on a query — docs, tutorials,"
+            + " blog posts. Not domain-restricted, unlike searchVideos/searchPracticeProblems.")
+    public List<SearchResult> webSearch(
+        @P("search query") String query,
+        @P(
+                "search strategy: AUTO when unsure, FAST for exact terms or names, INSTANT for"
+                    + " quick lookups where speed matters most")
+            SearchType type) {
+      return searchTools.search(query, type, List.of());
+    }
+
+    @Tool(
+        "Search specifically for a video walkthrough of a query, restricted to trusted video"
+            + " platforms. Use this instead of webSearch when looking for the watch lane.")
+    public List<SearchResult> searchVideos(
+        @P("search query") String query,
+        @P(
+                "search strategy: AUTO when unsure, FAST for exact terms or names, INSTANT for"
+                    + " quick lookups where speed matters most")
+            SearchType type) {
+      return searchTools.search(query, type, VIDEO_DOMAINS);
+    }
+
+    @Tool(
+        "Search specifically for hands-on practice problems or exercises on a query, restricted"
+            + " to trusted practice sites. Use this instead of webSearch for the practice lane.")
+    public List<SearchResult> searchPracticeProblems(
+        @P("search query") String query,
+        @P(
+                "search strategy: AUTO when unsure, FAST for exact terms or names, INSTANT for"
+                    + " quick lookups where speed matters most")
+            SearchType type) {
+      return searchTools.search(query, type, PRACTICE_DOMAINS);
+    }
+
+    @Tool("List resources this topic already has, so you don't re-propose them on a refresh.")
+    public List<ExistingResource> existingResources() {
+      return searchTools.existingResourcesFor(topicId);
+    }
+  }
+}
